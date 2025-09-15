@@ -1,0 +1,23 @@
+# Core ML/Deep Learning
+tensorflow>=2.11
+scikit-learn
+numpy
+pandas
+
+# Visualization / Analysis
+matplotlib
+seaborn
+
+# NLP utilities
+nltk
+emoji
+
+# I/O + Data
+pyarrow
+
+# Demo App
+gradio
+
+transformers
+datasets
+torch
