@@ -35,11 +35,11 @@ def clean_and_tokenize(text, emoji_map, lemmatizer):
     """
     Cleans, tokenizes, and lemmatizes one text string.
     """
-    # 1. Placeholder & HTML
+    # Placeholder & HTML
     text = text.replace("[NAME]", " name_token ")
     text = re.sub(r'<[^>]+>', ' ', text)
 
-    # 2. Standardize contractions
+    # Standardize contractions
     for patt, repl in {
         r"\bI'm\b": "i 'm",
         r"\bit's\b": "it 's",
@@ -49,23 +49,23 @@ def clean_and_tokenize(text, emoji_map, lemmatizer):
     }.items():
         text = re.sub(patt, repl, text, flags=re.IGNORECASE)
 
-    # 3. Hashtags & handles
+    #  Hashtags & handles
     text = re.sub(r'#(\w+)', r'\1', text)
     text = re.sub(r'@\w+', ' user_token ', text)
 
-    # 4. Emojis → tokens
+    # Emojis → tokens
     for emo, repl in emoji_map.items():
         text = text.replace(emo, repl)
 
-    # 5. Remove non-ASCII, collapse repeats
+    # Remove non-ASCII, collapse repeats
     text = re.sub(r'[^\x00-\x7F]+', ' ', text)
     text = re.sub(r'(.)\1{2,}', r'\1\1', text)
 
-    # 6. Lowercase & keep letters/underscores/spaces/quotes
+    # Lowercase & keep letters/underscores/spaces/quotes
     text = text.lower()
     text = re.sub(r"[^a-z'\s_#@]", ' ', text)
 
-    # 7. Tokenize & lemmatize
+    # Tokenize & lemmatize
     tokens = word_tokenize(text)
     tokens = [lemmatizer.lemmatize(t, pos='v') if t.isalpha() else t for t in tokens]
     return tokens

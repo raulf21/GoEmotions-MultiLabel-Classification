@@ -2,7 +2,7 @@ import pickle, json
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from models import AdditiveAttentionPooling  # import registers the class too
+from models import AdditiveAttentionPooling 
 
 # Load tokenizer + configs
 with open("tokenizer.pkl", "rb") as f:

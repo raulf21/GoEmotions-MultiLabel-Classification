@@ -1,6 +1,9 @@
 import tensorflow as tf
 from tensorflow import keras
+from tensorflow.keras import Model, Input
+from tensorflow.keras.layers import Embedding, Bidirectional, LSTM, Dense, Dropout
 from tensorflow.keras.utils import register_keras_serializable
+
 
 @register_keras_serializable(package="Custom")
 class AdditiveAttentionPooling(keras.layers.Layer):
@@ -43,7 +46,6 @@ def build_bilstm_with_attention(
     dropout_rate: float = 0.5,
     trainable_embeddings: bool = True,
 ):
-    # IMPORTANT: tuple shape (max_len,) not (max_len)
     inp = Input(shape=(int(max_len),), dtype="int32", name="tokens")
 
     if embedding_matrix is not None:
