@@ -1,3 +1,5 @@
+# data_preprocessing.py
+import os
 import re
 import pandas as pd
 import nltk
@@ -7,20 +9,91 @@ import emoji
 from collections import Counter
 import numpy as np
 
-# Tokenizer/padding (local, no fetching)
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 
-# Ensure tokenizers/lemmatizer data
-nltk.download('punkt')
-nltk.download('wordnet')
+# Ensure NLTK data
+nltk.download("punkt")
+nltk.download("wordnet")
 
-NUM_CLASSES = 28
+# --------------------------
+# Label definitions
+# --------------------------
+LABELS_FINE = [
+    "admiration","amusement","anger","annoyance","approval","caring","confusion","curiosity",
+    "desire","disappointment","disapproval","disgust","embarrassment","excitement","fear","gratitude",
+    "grief","joy","love","nervousness","optimism","pride","realization","relief","remorse","sadness","surprise","neutral"
+]
 
+ekman_mapping = {
+    "anger": ["anger", "annoyance", "disapproval"],
+    "disgust": ["disgust"],
+    "fear": ["fear", "nervousness"],
+    "joy": ["joy","amusement","approval","excitement","gratitude",
+            "love","optimism","relief","pride","admiration","desire","caring"],
+    "sadness": ["sadness","disappointment","embarrassment","grief","remorse"],
+    "surprise": ["surprise","realization","confusion","curiosity"]
+}
+label_to_ekman = {emo: group for group, emos in ekman_mapping.items() for emo in emos}
+
+positive = set(ekman_mapping["joy"])
+negative = set(ekman_mapping["anger"] + ekman_mapping["disgust"] + ekman_mapping["fear"] + ekman_mapping["sadness"])
+neutral = {"neutral"}
+
+# --------------------------
+# Mapping helpers
+# --------------------------
+def map_labels_to_ekman(fine_labels, label_names=LABELS_FINE):
+    """Map fine-grained labels -> Ekman categories, drop neutral."""
+    return list({label_to_ekman[label_names[i]] for i in fine_labels if label_names[i] in label_to_ekman})
+
+def map_to_sentiment(fine_labels, label_names=LABELS_FINE):
+    """Map fine-grained labels -> sentiment (pos/neg/neutral)."""
+    groups = set()
+    for i in fine_labels:
+        l = label_names[i]
+        if l in positive:
+            groups.add("positive")
+        elif l in negative:
+            groups.add("negative")
+        elif l in neutral:
+            groups.add("neutral")
+    return list(groups)
+
+def add_label_strs(df, granularity):
+    """Add label_strs column to dataframe based on granularity"""
+    if granularity == "fine":
+        df['label_strs'] = df['labels'].apply(lambda idxs: [LABELS_FINE[i] for i in idxs])
+        return LABELS_FINE
+    elif granularity == "ekman":
+        df['label_strs'] = df['labels'].apply(lambda idxs: map_labels_to_ekman(idxs, LABELS_FINE))
+        return ["anger","disgust","fear","joy","sadness","surprise"]
+    elif granularity == "sentiment":
+        df['label_strs'] = df['labels'].apply(lambda idxs: map_to_sentiment(idxs, LABELS_FINE))
+        return ["positive","negative","neutral"]
+    else:
+        raise ValueError("granularity must be fine|ekman|sentiment")
+
+# -------------------------------------
+# Data Loading
+# -------------------------------------
+def load_goemotions():
+    splits = {
+        'train':      'simplified/train-00000-of-00001.parquet',
+        'validation': 'simplified/validation-00000-of-00001.parquet',
+        'test':       'simplified/test-00000-of-00001.parquet'
+    }
+    base = "hf://datasets/google-research-datasets/go_emotions/"
+    return (
+        pd.read_parquet(base + splits['train']),
+        pd.read_parquet(base + splits['validation']),
+        pd.read_parquet(base + splits['test']),
+    )
+
+# --------------------------
+# BiLSTM Specific Preprocessing
+# --------------------------
 def get_emoji_map(df):
-    """
-    Generates a map of the top 50 most frequent emojis to descriptive tokens.
-    """
     all_nonascii = df['text'].str.findall(r'[^\x00-\x7F]').explode().dropna()
     all_emojis = [ch for ch in all_nonascii if ch in emoji.EMOJI_DATA]
     top_50 = [emo for emo, _ in Counter(all_emojis).most_common(50)]
@@ -32,14 +105,14 @@ def get_emoji_map(df):
     return emoji_map
 
 def clean_and_tokenize(text, emoji_map, lemmatizer):
-    """
-    Cleans, tokenizes, and lemmatizes one text string.
-    """
-    # Placeholder & HTML
     text = text.replace("[NAME]", " name_token ")
     text = re.sub(r'<[^>]+>', ' ', text)
-
-    # Standardize contractions
+    
+    text = re.sub(r'/u/\w+', ' user_mention ', text)      # Reddit user mentions like /u/username
+    text = re.sub(r'/r/\w+', ' subreddit_mention ', text) # Subreddit mentions like /r/funny
+    text = re.sub(r'www\.\S+', ' url_token ', text)       # URLs
+    
+    # Your existing contractions (keep this):
     for patt, repl in {
         r"\bI'm\b": "i 'm",
         r"\bit's\b": "it 's",
@@ -49,70 +122,53 @@ def clean_and_tokenize(text, emoji_map, lemmatizer):
     }.items():
         text = re.sub(patt, repl, text, flags=re.IGNORECASE)
 
-    #  Hashtags & handles
     text = re.sub(r'#(\w+)', r'\1', text)
     text = re.sub(r'@\w+', ' user_token ', text)
 
-    # Emojis → tokens
     for emo, repl in emoji_map.items():
         text = text.replace(emo, repl)
 
-    # Remove non-ASCII, collapse repeats
     text = re.sub(r'[^\x00-\x7F]+', ' ', text)
     text = re.sub(r'(.)\1{2,}', r'\1\1', text)
 
-    # Lowercase & keep letters/underscores/spaces/quotes
     text = text.lower()
     text = re.sub(r"[^a-z'\s_#@]", ' ', text)
 
-    # Tokenize & lemmatize
     tokens = word_tokenize(text)
     tokens = [lemmatizer.lemmatize(t, pos='v') if t.isalpha() else t for t in tokens]
     return tokens
 
-# Rebuild label vectors after filtering
-def build_label_vector(lbls, NUM_CLASSES=NUM_CLASSES):
-    vec = np.zeros(NUM_CLASSES, dtype=np.float32)
-    vec[lbls] = 1.0
+def build_label_vector(lbls, classes):
+    vec = np.zeros(len(classes), dtype=np.float32)
+    for l in lbls:
+        if isinstance(l, int):   # fine labels (indices)
+            vec[l] = 1.0
+        else:                    # ekman/sentiment (strings)
+            if l in classes:
+                vec[classes.index(l)] = 1.0
     return vec
 
-# ----------------------------
-# Tokenizer, padding, and GloVe embeddings (LOCAL ONLY)
-# ----------------------------
 def build_sequences_and_embeddings(df_train, df_val, df_test,
                                    glove_path="./glove.twitter.27B.100d.txt",
                                    embedding_dim=100):
-    """
-    From tokenized DataFrames, build:
-      - tokenizer fit on train
-      - padded integer sequences (X_train/val/test)
-      - label matrices (y_train/val/test) from label_vector
-      - embedding_matrix loaded from LOCAL GloVe file
-      - MAX_LEN and vocab_size
-      - glove_words: set of words present in the GloVe file (for raw OOV analysis)
-    """
-    # y_* from multi-hot label_vector
+    """Build sequences and embedding matrix for BiLSTM"""
     y_train = np.stack(df_train["label_vector"].values)
     y_val   = np.stack(df_val["label_vector"].values)
     y_test  = np.stack(df_test["label_vector"].values)
 
-    # Join tokens into strings for tokenizer
     texts_train = [' '.join(t) for t in df_train['tokens']]
-    texts_val   = [' '.join(t) for t in df_val  ['tokens']]
-    texts_test  = [' '.join(t) for t in df_test ['tokens']]
+    texts_val   = [' '.join(t) for t in df_val['tokens']]
+    texts_test  = [' '.join(t) for t in df_test['tokens']]
 
-    # Fit tokenizer on train only
-    tokenizer = Tokenizer(oov_token="<OOV>")  # 0: PAD, 1: OOV
+    tokenizer = Tokenizer(oov_token="<OOV>")
     tokenizer.fit_on_texts(texts_train)
     vocab_size = len(tokenizer.word_index) + 1
     print(f"[Tokenizer] vocab size = {vocab_size:,}")
 
-    # Sequences and padding
     train_seq = tokenizer.texts_to_sequences(texts_train)
     val_seq   = tokenizer.texts_to_sequences(texts_val)
     test_seq  = tokenizer.texts_to_sequences(texts_test)
 
-    # 95th percentile length, with a small floor
     MAX_LEN = int(df_train['tokens'].map(len).quantile(0.95))
     print(f"[Padding] MAX_LEN (95th pct) = {MAX_LEN}")
 
@@ -120,31 +176,8 @@ def build_sequences_and_embeddings(df_train, df_val, df_test,
     X_val   = pad_sequences(val_seq,   maxlen=MAX_LEN, padding='post', truncating='post')
     X_test  = pad_sequences(test_seq,  maxlen=MAX_LEN, padding='post', truncating='post')
 
-    print(f"[Shapes] X_train {X_train.shape} | X_val {X_val.shape} | X_test {X_test.shape}")
-    print(f"         y_train {y_train.shape} | y_val {y_val.shape} | y_test {y_test.shape}")
-
-    # Quick peek
-    if len(X_train):
-        import textwrap
-        idx = np.random.randint(len(X_train))
-        print("\n[Sample seq] original:", textwrap.shorten(texts_train[idx], 120))
-        print("              indices :", X_train[idx, :20], "...")
-        print("              tokens  :", tokenizer.sequences_to_texts([X_train[idx, :]]))
-        print("              labels  :", y_train[idx, :])
-
-        two_label_idxs = np.where(y_train.sum(axis=1) == 2)[0]
-        if len(two_label_idxs):
-            idx2 = np.random.choice(two_label_idxs)
-            print("\n[Sample seq: 2 labels] original:", textwrap.shorten(texts_train[idx2], 120))
-            print("                        indices :", X_train[idx2, :20], "...")
-            print("                        tokens  :", tokenizer.sequences_to_texts([X_train[idx2, :]]))
-            print("                        labels  :", y_train[idx2, :])
-        else:
-            print("No examples with exactly 2 labels found in the training set.")
-
-    # Build GloVe embedding matrix from LOCAL file only
+    # Load GloVe embeddings
     embedding_matrix = np.zeros((vocab_size, embedding_dim), dtype="float32")
-    hits, misses = 0, 0
     try:
         with open(glove_path, encoding="utf-8") as f:
             for line in f:
@@ -152,85 +185,80 @@ def build_sequences_and_embeddings(df_train, df_val, df_test,
                 word, vec = parts[0], parts[1:]
                 if word in tokenizer.word_index:
                     embedding_matrix[tokenizer.word_index[word]] = np.asarray(vec, dtype='float32')
-                    hits +=1
-                else:
-                    misses +=1
     except FileNotFoundError:
-        print(f"[GloVe] File not found at: {glove_path}. "
-              f"Place glove.twitter.27B.100d.txt in the same directory as this script or update glove_path.")
-
-    coverage = hits / vocab_size
-    print(f"[GloVe] words covered = {hits:,} / {vocab_size:,}  ({coverage:.1%})")
-    print("[GloVe] embedding_matrix shape:", embedding_matrix.shape)
+        print(f"[GloVe] File not found at {glove_path}")
 
     return (X_train, X_val, X_test,
             y_train, y_val, y_test,
             tokenizer, embedding_matrix, MAX_LEN, vocab_size)
-# -------------- main --------------
 
-def main():
-    """
-    Load GoEmotions (simplified), preprocess, and return processed DataFrames
-    plus tokenized sequences and GloVe embeddings (from local file).
-    """
-    # Load the datasets (pandas + parquet from HF hub)
-    splits = {
-        'train':      'simplified/train-00000-of-00001.parquet',
-        'validation': 'simplified/validation-00000-of-00001.parquet',
-        'test':       'simplified/test-00000-of-00001.parquet'
-    }
-    base = "hf://datasets/google-research-datasets/go_emotions/"
+def preprocess_for_bilstm(granularity="fine", glove_path="./glove.twitter.27B.100d.txt"):
+    df_train, df_val, df_test = load_goemotions()
 
-    df_train = pd.read_parquet(base + splits['train'])
-    df_val   = pd.read_parquet(base + splits['validation'])
-    df_test  = pd.read_parquet(base + splits['test'])
+    classes = None
+    for df in [df_train, df_val, df_test]:
+        classes = add_label_strs(df, granularity)
 
-    print("Datasets loaded.")
-    print("Train shape:", df_train.shape)
-    print("Validation shape:", df_val.shape)
-    print("Test shape:", df_test.shape)
-
-    # Emoji map from train
     emoji_map = get_emoji_map(df_train)
-    print("Emoji map (first 10):", list(emoji_map.items())[:10])
-
     lemmatizer = WordNetLemmatizer()
 
-    # Tokenize all splits
-    print("Applying cleaning and tokenization to all splits...")
-    df_train['tokens'] = df_train['text'].apply(lambda x: clean_and_tokenize(x, emoji_map, lemmatizer))
-    df_val['tokens']   = df_val['text'].apply(lambda x: clean_and_tokenize(x, emoji_map, lemmatizer))
-    df_test['tokens']  = df_test['text'].apply(lambda x: clean_and_tokenize(x, emoji_map, lemmatizer))
+    for df in [df_train, df_val, df_test]:
+        df['tokens'] = df['text'].apply(lambda x: clean_and_tokenize(x, emoji_map, lemmatizer))
+        df['label_vector'] = df['label_strs'].apply(lambda lbls: build_label_vector(lbls, classes))
 
-    # Label vectors
-    print("Building label vectors...")
-    df_train['label_vector'] = df_train['labels'].apply(build_label_vector)
-    df_val['label_vector']   = df_val['labels'].apply(build_label_vector)
-    df_test['label_vector']  = df_test['labels'].apply(build_label_vector)
+    sequences_and_embeddings = build_sequences_and_embeddings(df_train, df_val, df_test, glove_path)
 
-    # Verify a couple of rows
-    print("First train row post-process:\n", df_train[['text','labels','tokens','label_vector']].iloc[0])
-    print("First val row post-process:\n", df_val[['text','labels','tokens','label_vector']].iloc[0])
-    print("First test row post-process:\n", df_test[['text','labels','tokens','label_vector']].iloc[0])
+    print(f"[DEBUG] {granularity.upper()} unique labels: {set().union(*df_train['label_strs'])}")
+    return (df_train, df_val, df_test, *sequences_and_embeddings), classes
 
-    # Build sequences + embeddings from local file
-    print("\nBuilding sequences and GloVe embeddings...")
-    (X_train, X_val, X_test,
-     y_train, y_val, y_test,
-     tokenizer, embedding_matrix, MAX_LEN, vocab_size) = build_sequences_and_embeddings(
-        df_train, df_val, df_test,
-        glove_path="./glove.twitter.27B.100d.txt",
-        embedding_dim=100
-    )
+# --------------------------
+# Flair Specific Preprocessing
+# --------------------------
+def clean_text_flair(text):
+    text = text.replace("[NAME]", "NAME")
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
-    print("\nData preprocessing complete.")
-    return (df_train, df_val, df_test,
-            X_train, X_val, X_test,
-            y_train, y_val, y_test,
-            tokenizer, embedding_matrix, MAX_LEN, vocab_size)
+def df_to_flair_txt(df, out_path):
+    with open(out_path, 'w', encoding='utf-8') as f:
+        for _, row in df.iterrows():
+            labels = row.get("label_strs", [])
+            if not labels:
+                continue
+            clean_text = clean_text_flair(str(row["text"]))
+            label_prefixes = [f"__label__{l}" for l in labels]
+            line = " ".join(label_prefixes) + " " + clean_text
+            f.write(line + "\n")
 
-if __name__ == '__main__':
-    (train_data, val_data, test_data,
-     X_train, X_val, X_test,
-     y_train, y_val, y_test,
-     tokenizer, embedding_matrix, MAX_LEN, vocab_size) = main()
+def prepare_flair_dataset(df_train, df_val, df_test, granularity):
+    folder = f"flair_dataset_{granularity}"
+    os.makedirs(folder, exist_ok=True)
+    df_to_flair_txt(df_train, os.path.join(folder, "train.txt"))
+    df_to_flair_txt(df_val, os.path.join(folder, "dev.txt"))
+    df_to_flair_txt(df_test, os.path.join(folder, "test.txt"))
+    print(f"Flair dataset prepared in: {folder}")
+    print(f"[DEBUG] {granularity.upper()} unique labels: {set().union(*df_train['label_strs'])}")
+    return folder
+
+def preprocess_for_flair(granularity="fine"):
+    df_train, df_val, df_test = load_goemotions()
+    classes = None
+    for df in [df_train, df_val, df_test]:
+        classes = add_label_strs(df, granularity)
+    dataset_folder = prepare_flair_dataset(df_train, df_val, df_test, granularity)
+    return (df_train, df_val, df_test, dataset_folder), classes
+
+# --------------------------
+# Unified interface
+# --------------------------
+def preprocess_data(model_type, granularity="fine", **kwargs):
+    if model_type.lower() == "bilstm":
+        return preprocess_for_bilstm(granularity, kwargs.get('glove_path', './glove.twitter.27B.100d.txt'))
+    elif model_type.lower() == "flair":
+        return preprocess_for_flair(granularity)
+    else:
+        raise ValueError("model_type must be 'bilstm' or 'flair'")
+
+
+

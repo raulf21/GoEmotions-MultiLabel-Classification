@@ -25,11 +25,16 @@ nlp/
 *.hdf5
 *.keras
 *.ckpt
+*.pt
 *.ckpt.*
 checkpoint/
 checkpoints/
 *.pb
 *.tflite
+
+# ─── Flair models ───
+flair_models/
+flair_dataset_*/
 
 # ─── Training outputs ───
 *.npy

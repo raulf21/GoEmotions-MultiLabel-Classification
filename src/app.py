@@ -10,6 +10,10 @@ import gradio as gr
 from tensorflow import keras
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 
+# Flair imports 
+from flair.models import TextClassifer
+from flair.data import Sentence
+
 # --- custom layer (must be registered with @keras.saving.register_keras_serializable in models.py) ---
 from models import AdditiveAttentionPooling
 
@@ -21,7 +25,7 @@ CLASS_THRESHOLDS_PATH = "per_class_thresholds.npy"  # optional
 EMOJI_MAP_PATH = "emoji_map.json"                   # optional export you may have saved
 
 # ------------- load artifacts ----------
-print("[startup] Loading model…")
+print("[startup] Loading BiLSTm model…")
 model = keras.models.load_model(
     MODEL_PATH,
     compile=False,
@@ -54,6 +58,13 @@ try:
 except Exception:
     EMOJI_MAP = None
     print("[startup] No emoji map; skipping emoji normalization.")
+
+
+# Load flair
+print("[startup] Loading Flair model…")
+flair_model = TextClassifer.load("flair_mulit_label/final-model.pt")
+print("[startup] Flair model loaded.")
+
 
 # ---------------- labels & display emojis ----------------
 LABELS = [
@@ -115,51 +126,59 @@ def to_ids_from_tokens(tokens_list: List[List[str]]):
     seqs = tokenizer.texts_to_sequences(texts)
     return pad_sequences(seqs, maxlen=MAX_LEN, padding="post", truncating="post")
 
-# ---------------- prediction ----------------
-def predict(text: str, use_class_thresh: bool, global_thresh: float):
-    if not text or not text.strip():
-        return "Type something above 👆", ""
-
+# ---------------- Prediction functions ----------------
+def predict_bilstm(text: str, use_class_thresh: bool, global_thresh: float):
     toks = clean_and_tokenize(text, EMOJI_MAP)
     X = to_ids_from_tokens([toks])
-    probs = model.predict(X, verbose=0)[0]  # shape (28,)
+    probs = model.predict(X, verbose=0)[0]
 
-    # choose thresholds
-    if use_class_thresh and per_class_thresh is not None and len(per_class_thresh) == len(LABELS):
+    if use_class_thresh and per_class_thresh is not None:
         th = per_class_thresh
     else:
         th = np.full_like(probs, float(global_thresh), dtype=np.float32)
 
-    # multi-label: return ALL labels with prob >= threshold
     idx = np.where(probs >= th)[0]
     kept = sorted([(LABELS[i], float(probs[i])) for i in idx], key=lambda x: x[1], reverse=True)
 
     if not kept:
-        # show top-3 for feedback
-        topk = np.argsort(-probs)[:3]
-        top3 = [(LABELS[i], float(probs[i])) for i in topk]
-        strip_ = " ".join(EMOJI.get(lbl, "") for lbl, _ in top3)
-        md = f"{strip_}\n\n_No labels ≥ threshold; top-3 scores:_\n\n" + " · ".join(
-            f"{EMOJI.get(lbl,'')} **{lbl}** ({p:.2f})" for lbl, p in top3
-        )
-        table = "\n".join(f"{lbl}\t{p:.3f}" for lbl, p in top3)
-        return md, table
+        top3 = np.argsort(-probs)[:3]
+        top3 = [(LABELS[i], float(probs[i])) for i in top3]
+        return " · ".join(f"{EMOJI.get(lbl,'')} **{lbl}** ({p:.2f})" for lbl, p in top3)
+    return " · ".join(f"{EMOJI.get(lbl,'')} **{lbl}** ({p:.2f})" for lbl, p in kept)
 
-    strip_ = " ".join(EMOJI.get(lbl, "") for lbl, _ in kept)
-    md = f"{strip_}\n\n" + " · ".join(f"{EMOJI.get(lbl,'')} **{lbl}** ({p:.2f})" for lbl, p in kept)
-    table = "\n".join(f"{lbl}\t{p:.3f}" for lbl, p in kept)
-    return md, table
+def predict_flair(text: str, threshold: float):
+    sentence = Sentence(text)
+    flair_model.predict(sentence)
+    labels = [(l.value, l.score) for l in sentence.labels]
+    kept = [(lbl, sc) for lbl, sc in labels if sc >= threshold]
+    if not kept:
+        top3 = sorted(labels, key=lambda x: x[1], reverse=True)[:3]
+        return " · ".join(f"{EMOJI.get(lbl,'')} **{lbl}** ({p:.2f})" for lbl, p in top3)
+    return " · ".join(f"{EMOJI.get(lbl,'')} **{lbl}** ({p:.2f})" for lbl, p in kept)
+
+def predict_both(text: str, use_class_thresh: bool, global_thresh: float):
+    if not text.strip():
+        return "Type something above 👆", "Type something above 👆"
+
+    bilstm_out = predict_bilstm(text, use_class_thresh, global_thresh)
+    flair_out = predict_flair(text, threshold=global_thresh)
+
+    return bilstm_out, flair_out
 
 # ---------------- UI ----------------
-with gr.Blocks(title="GoEmotions — BiLSTM + Attention") as demo:
-    gr.Markdown("## 😄 GoEmotions — BiLSTM + Attention\nType a sentence, set the threshold, hit **Predict**.")
+with gr.Blocks(title="GoEmotions — BiLSTM + Flair") as demo:
+    gr.Markdown("## 😄 GoEmotions — BiLSTM + Flair\nType a sentence, and see predictions from both models.")
+
     txt = gr.Textbox(label="Input text", placeholder="e.g., I'm so excited for tonight!! 😂", lines=3)
     with gr.Row():
-        use_class = gr.Checkbox(label="Use per-class calibrated thresholds (validation)", value=True)
-        slider = gr.Slider(0.0, 1.0, value=0.4, step=0.01, label="Global threshold (used if unchecked)")
-    out_md = gr.Markdown()
-    out_txt = gr.Textbox(label="Label\tProb", interactive=False)
-    gr.Button("Predict").click(predict, inputs=[txt, use_class, slider], outputs=[out_md, out_txt])
+        use_class = gr.Checkbox(label="Use per-class calibrated thresholds (BiLSTM only)", value=True)
+        slider = gr.Slider(0.0, 1.0, value=0.4, step=0.01, label="Threshold")
+
+    with gr.Row():
+        bilstm_box = gr.Markdown(label="BiLSTM Prediction")
+        flair_box = gr.Markdown(label="Flair Prediction")
+
+    gr.Button("Predict").click(predict_both, inputs=[txt, use_class, slider], outputs=[bilstm_box, flair_box])
 
 if __name__ == "__main__":
     demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True, debug=True)
