@@ -1,72 +1,103 @@
-# ─── Python cache ───
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.egg-info/
-*.egg
-*.log
-
-# ─── Virtual environments ───
-.env
-.venv
+*.py[cod]
+*$py.class
+*.so
+.Python
 env/
 venv/
-nlp/
-*.conda
-*.yaml
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# ─── Jupyter/Colab ───
-.ipynb_checkpoints/
-*.ipynb~
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
 
-# ─── Model artifacts ───
-*.h5
-*.hdf5
-*.keras
-*.ckpt
-*.pt
-*.ckpt.*
-checkpoint/
-checkpoints/
-*.pb
-*.tflite
+# Environment variables
+.env
+.venv
 
-# ─── Flair models ───
-flair_models/
-flair_dataset_*/
-
-# ─── Training outputs ───
-*.npy
-*.npz
-*.pkl
-*.json
-*.csv
-*.tsv
-*.txt
-
-# ─── Embeddings (too large for git) ───
-glove.twitter.27B.25d.txt
-glove.twitter.27B.50d.txt
-glove.twitter.27B.100d.txt
-glove.twitter.27B.200d.txt
-
-# ─── Local data ───
-data/
-*.parquet
-*.sqlite
-
-# ─── Results / artifacts ───
-*.png
-*.jpg
-*.jpeg
-*.svg
-*.pdf
-*.mp4
-*.gif
-
-# ─── IDE/project files ───
+# IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+
+# MacOS
 .DS_Store
-Thumbs.db
+
+# Model files (LARGE - don't commit to GitHub!)
+*.keras
+*.h5
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.pkl
+*.npy
+*.ckpt
+
+# Model directories
+flair_models/
+distilbert_*/
+best_bilstm_*/
+checkpoints/
+
+# Data files (if large)
+*.csv
+*.tsv
+data/
+datasets/
+
+# GloVe embeddings (LARGE!)
+glove.twitter.27B.zip
+glove.twitter.27B.*.txt
+*.vec
+
+# Logs
+*.log
+logs/
+runs/
+tensorboard/
+
+# Output files
+outputs/
+results/
+*.out
+*.err
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Checkpoints and training artifacts
+src/results_*/
+src/checkpoint*/
+src/logs_*/
+src/runs/
+
+# Flair dataset files (can be regenerated)
+src/flair_dataset_*/
+
+# Preprocessing configs (can be regenerated)
+src/preprocess_config_*.json
+
+# TensorBoard logs
+*.tfevents.*
+events.out.tfevents.*

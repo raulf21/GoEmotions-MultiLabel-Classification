@@ -1,28 +1,20 @@
-# train_biLSTM.py
+# train_biLSTM_fixed.py
 """
-BiLSTM + Attention training for GoEmotions at multiple granularities:
-- fine (28 labels)
-- ekman (6 groups)
-- sentiment (3 groups)
-
-Workflow (academically standard):
-1. Merge provided train + validation into one training set.
-2. Do KFold cross-validation on that combined set to grid search hyperparams.
-3. Select best params from CV.
-4. Split merged training into train/val for final training (80/20).
-5. Retrain best model on final train split with clean validation.
-6. Evaluate once on held-out test set.
-
-FORCED CPU-ONLY EXECUTION (ignores GPU/MPS).
+BiLSTM + Attention training with FIXED SPLITS (aligned with Flair/DistilBERT)
+- Uses original train/val/test splits from GoEmotions
+- Uses fixed threshold of 0.4 for all classes (no per-class optimization)
+- Fair comparison with other models
 """
 
 import time
+import pickle  # Add this
+import json
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
     f1_score, precision_score, recall_score, classification_report
 )
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import KFold
 
 import tensorflow as tf
 from tensorflow import keras
@@ -41,81 +33,116 @@ EPOCHS_FINAL   = 10
 BATCH_SIZE     = 64
 HIDDEN_DIM     = 128
 DROPOUT_RATE   = 0.5
-FIXED_THRESH   = 0.4
+THRESHOLD      = 0.4  # Fixed threshold for all classes
 GAMMAS         = [1.5, 2.0]
 ALPHA_SCALES   = [0.75, 1.0]
-FINAL_VAL_SPLIT = 0.2  # Hold out 20% of merged training for final validation
 SEED           = 42
 
-# -----------------------------
-# Force CPU-only
-# -----------------------------
-tf.config.set_visible_devices([], "GPU")
-print("⚠️ Forcing TensorFlow to run on CPU only.")
 
 # -----------------------------
 # Utilities
 # -----------------------------
 def macro_f1_at_threshold(y_true, y_prob, thresh=0.4):
+    """Calculate macro F1 at a fixed threshold"""
     y_pred = (y_prob >= thresh).astype(int)
     return f1_score(y_true, y_pred, average="macro", zero_division=0)
 
+
 def class_balanced_alpha(y_train, beta=0.999):
+    """Calculate class-balanced alpha weights for focal loss"""
     n_c = y_train.sum(axis=0) + 1e-9
     eff_num = 1.0 - np.power(beta, n_c)
     w = (1.0 - beta) / eff_num
     w = w / w.mean()
     return w.astype(np.float32)
 
+
 def make_focal_loss(alpha_vec, gamma):
+    """Create focal loss with given alpha and gamma"""
     return keras.losses.BinaryFocalCrossentropy(
         gamma=gamma,
         alpha=alpha_vec,
         from_logits=False
     )
 
+
+def evaluate_model(y_true, y_prob, labels, threshold=0.4, split_name="TEST"):
+    """Evaluate model with fixed threshold"""
+    y_pred = (y_prob >= threshold).astype(int)
+    
+    macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    micro_f1 = f1_score(y_true, y_pred, average="micro", zero_division=0)
+    macro_prec = precision_score(y_true, y_pred, average="macro", zero_division=0)
+    macro_rec = recall_score(y_true, y_pred, average="macro", zero_division=0)
+    
+    print(f"\n===== {split_name} PERFORMANCE (threshold={threshold}) =====")
+    print(f"Macro Precision: {macro_prec:.4f}, Macro Recall: {macro_rec:.4f}, Macro F1: {macro_f1:.4f}")
+    print(f"Micro F1: {micro_f1:.4f}")
+    print("\nPer-class performance:")
+    print(classification_report(y_true, y_pred, target_names=labels, zero_division=0))
+    
+    return {
+        'macro_f1': macro_f1,
+        'micro_f1': micro_f1,
+        'macro_precision': macro_prec,
+        'macro_recall': macro_rec
+    }
+
+
 # -----------------------------
 # Training loop
 # -----------------------------
 def run_training(granularity="fine"):
-    print(f"\n### Training for {granularity.upper()} labels ###")
+    print(f"\n### Training BiLSTM for {granularity.upper()} labels ###")
 
-    # Load & preprocess with val included
-    (
-        df_train, df_val, df_test,
-        X_train, X_val, X_test,
-        y_train, y_val, y_test,
-        tokenizer, embedding_matrix, MAX_LEN, vocab_size
-    ), LABELS = preprocess_for_bilstm(granularity)
+    # Load & preprocess (using original splits)
+    output, LABELS = preprocess_for_bilstm(granularity=granularity)
 
-    # Merge train + val into one big training set for hyperparameter search
-    df_train_merged = pd.concat([df_train, df_val], ignore_index=True)
-    X_train_merged  = np.concatenate([X_train, X_val], axis=0)
-    y_train_merged  = np.concatenate([y_train, y_val], axis=0)
+    X_train = output.X_train
+    X_val = output.X_val
+    X_test = output.X_test
+    y_train = output.y_train
+    y_val = output.y_val
+    y_test = output.y_test
+    tokenizer = output.tokenizer
+    embedding_matrix = output.embedding_matrix
+    MAX_LEN = output.max_len
+    vocab_size = output.vocab_size
+
+    print(f"\nDataset splits:")
+    print(f"  Training: {len(X_train)} samples")
+    print(f"  Validation: {len(X_val)} samples")
+    print(f"  Test: {len(X_test)} samples")
 
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
 
-    base_alpha = class_balanced_alpha(y_train_merged, beta=0.999)
+    # Calculate class weights on training set only
+    base_alpha = class_balanced_alpha(y_train, beta=0.999)
 
-    # Grid search with CV on merged training data
+    # =====================================================================
+    # PHASE 1: Cross-validation for hyperparameter selection (on train only)
+    # =====================================================================
+    print("\n" + "="*70)
+    print("PHASE 1: Hyperparameter Search (CV on training set only)")
+    print("="*70)
+    
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     best_mean_f1 = -1.0
-    best_params  = None
+    best_params = None
 
-    print("Starting hyperparameter search with cross-validation...")
     for gamma in GAMMAS:
         for scale in ALPHA_SCALES:
             alpha_vec = (base_alpha * scale).astype(np.float32)
             fold_f1s = []
 
-            for fold, (tr_idx, va_idx) in enumerate(kf.split(X_train_merged), start=1):
+            for fold, (tr_idx, va_idx) in enumerate(kf.split(X_train), start=1):
                 K.clear_session()
                 model = build_bilstm_with_attention(
                     vocab_size=vocab_size,
                     max_len=MAX_LEN,
                     embedding_matrix=embedding_matrix,
-                    output_dim=y_train_merged.shape[1],
+                    output_dim=y_train.shape[1],
                     hidden_dim=HIDDEN_DIM,
                     dropout_rate=DROPOUT_RATE,
                     trainable_embeddings=True,
@@ -124,16 +151,16 @@ def run_training(granularity="fine"):
 
                 es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=2, restore_best_weights=True)
                 model.fit(
-                    X_train_merged[tr_idx], y_train_merged[tr_idx],
-                    validation_data=(X_train_merged[va_idx], y_train_merged[va_idx]),
+                    X_train[tr_idx], y_train[tr_idx],
+                    validation_data=(X_train[va_idx], y_train[va_idx]),  # ← CV within training set
                     epochs=EPOCHS_CV, batch_size=BATCH_SIZE,
-                    callbacks=[es], verbose=1
+                    callbacks=[es], verbose=0
                 )
 
-                probs = model.predict(X_train_merged[va_idx], verbose=0)
-                f1 = macro_f1_at_threshold(y_train_merged[va_idx], probs, thresh=FIXED_THRESH)
+                probs = model.predict(X_train[va_idx], verbose=0)
+                f1 = macro_f1_at_threshold(y_train[va_idx], probs, thresh=THRESHOLD)
                 fold_f1s.append(f1)
-                print(f"[CV γ={gamma}, αx={scale}] Fold {fold}: F1={f1:.4f}")
+                print(f"[CV γ={gamma}, α×={scale}] Fold {fold}: F1={f1:.4f}")
 
             mean_f1 = float(np.mean(fold_f1s))
             print(f"→ γ={gamma}, α_scale={scale} | mean CV F1 = {mean_f1:.4f}")
@@ -141,32 +168,24 @@ def run_training(granularity="fine"):
             if mean_f1 > best_mean_f1:
                 best_mean_f1, best_params = mean_f1, (gamma, scale)
 
-    print(f"\nBEST (CV): γ={best_params[0]}, α_scale={best_params[1]}  (CV F1={best_mean_f1:.4f})")
+    print(f"\n🏆 BEST HYPERPARAMETERS (from CV): γ={best_params[0]}, α_scale={best_params[1]} (CV F1={best_mean_f1:.4f})")
 
-    # Now split the merged training data into final train/validation splits
-    # This creates a clean validation set that hasn't been seen during hyperparameter search
-    X_train_final, X_val_final, y_train_final, y_val_final = train_test_split(
-        X_train_merged, y_train_merged,
-        test_size=FINAL_VAL_SPLIT,
-        random_state=SEED,
-        stratify=None  # Could add stratification logic for multilabel if needed
-    )
+    # =====================================================================
+    # PHASE 2: Train final model on full training set
+    # =====================================================================
+    print("\n" + "="*70)
+    print("PHASE 2: Training Final Model on Full Training Set")
+    print("="*70)
     
-    print(f"\nFinal training splits:")
-    print(f"  Training: {len(X_train_final)} samples")
-    print(f"  Validation: {len(X_val_final)} samples") 
-    print(f"  Test (held-out): {len(X_test)} samples")
-
-    # Train final model with best hyperparameters on clean train/val split
     gamma_best, scale_best = best_params
-    alpha_best = (class_balanced_alpha(y_train_final, beta=0.999) * scale_best).astype(np.float32)
+    alpha_best = (base_alpha * scale_best).astype(np.float32)
 
     K.clear_session()
     final_model = build_bilstm_with_attention(
         vocab_size=vocab_size,
         max_len=MAX_LEN,
         embedding_matrix=embedding_matrix,
-        output_dim=y_train_final.shape[1],
+        output_dim=y_train.shape[1],
         hidden_dim=HIDDEN_DIM,
         dropout_rate=DROPOUT_RATE,
         trainable_embeddings=True,
@@ -174,50 +193,71 @@ def run_training(granularity="fine"):
     final_model.compile(optimizer="adam", loss=make_focal_loss(alpha_best, gamma_best))
 
     ckpt_path = f"best_bilstm_{granularity}.keras"
-    ckpt = keras.callbacks.ModelCheckpoint(
-        ckpt_path, monitor="val_loss", save_best_only=True
-    )
+    ckpt = keras.callbacks.ModelCheckpoint(ckpt_path, monitor="val_loss", save_best_only=True)
     es_final = keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True)
 
-    print("\nTraining final model with best hyperparameters...")
+    print(f"\nTraining with best hyperparameters (γ={gamma_best}, α_scale={scale_best})...")
     t0 = time.time()
     final_model.fit(
-        X_train_final, y_train_final,
-        validation_data=(X_val_final, y_val_final),  # ✅ Clean validation set
+        X_train, y_train,
+        validation_data=(X_val, y_val),  # ← Original validation set (never seen during CV)
         epochs=EPOCHS_FINAL, batch_size=BATCH_SIZE,
         callbacks=[es_final, ckpt],
         verbose=1
     )
-    print(f"\nFinal training time: {time.time() - t0:.1f}s")
+    training_time = time.time() - t0
+    print(f"\nTraining completed in {training_time:.1f}s")
+    print(f"Model saved to: {ckpt_path}")
 
-    # Final evaluation on completely held-out test set
-    print("\nEvaluating on held-out test set...")
+    # =====================================================================
+    # PHASE 3: Final evaluation on validation and test sets
+    # =====================================================================
+    print("\n" + "="*70)
+    print("PHASE 3: Final Evaluation")
+    print("="*70)
+    
+    # Evaluate on validation set
+    probs_val = final_model.predict(X_val, verbose=0)
+    val_results = evaluate_model(y_val, probs_val, LABELS, threshold=THRESHOLD, split_name="VALIDATION")
+    
+    # Evaluate on test set
     probs_test = final_model.predict(X_test, verbose=0)
-    y_pred = (probs_test >= FIXED_THRESH).astype(int)
+    test_results = evaluate_model(y_test, probs_test, LABELS, threshold=THRESHOLD, split_name="TEST")
 
-    macro_f1 = f1_score(y_test, y_pred, average="macro", zero_division=0)
-    micro_f1 = f1_score(y_test, y_pred, average="micro", zero_division=0)
-    macro_prec = precision_score(y_test, y_pred, average="macro", zero_division=0)
-    micro_prec = precision_score(y_test, y_pred, average="micro", zero_division=0)
-    macro_rec = recall_score(y_test, y_pred, average="macro", zero_division=0)
-    micro_rec = recall_score(y_test, y_pred, average="micro", zero_division=0)
-
-    print("\n===== TEST PERFORMANCE =====")
-    print(f"Macro Precision: {macro_prec:.4f}, Macro Recall: {macro_rec:.4f}, Macro F1: {macro_f1:.4f}")
-    print(f"Micro Precision: {micro_prec:.4f}, Micro Recall: {micro_rec:.4f}, Micro F1: {micro_f1:.4f}")
-    print("\nPer-class performance:")
-    print(classification_report(y_test, y_pred, target_names=LABELS, zero_division=0))
+    # Save tokenizer and config for app deployment
+    print("\n" + "="*70)
+    print("PHASE 4: Saving Artifacts for Deployment")
+    print("="*70)
+    
+    # Save tokenizer
+    tokenizer_path = f"tokenizer_{granularity}.pkl"
+    with open(tokenizer_path, "wb") as f:
+        pickle.dump(tokenizer, f)
+    print(f"✓ Saved tokenizer: {tokenizer_path}")
+    
+    # Save preprocessing config
+    config = {
+        "max_len": MAX_LEN,
+        "vocab_size": vocab_size,
+        "granularity": granularity,
+        "threshold": THRESHOLD,
+        "labels": LABELS
+    }
+    config_path = f"preprocess_config_{granularity}.json"
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"✓ Saved config: {config_path}")
+    
+    print("="*70)
 
     return {
         'granularity': granularity,
         'best_params': best_params,
         'cv_f1': best_mean_f1,
-        'test_metrics': {
-            'macro_f1': macro_f1,
-            'micro_f1': micro_f1,
-            'macro_precision': macro_prec,
-            'macro_recall': macro_rec
-        }
+        'training_time': training_time,
+        'val_results': val_results,
+        'test_results': test_results,
+        'threshold': THRESHOLD
     }
 
 
@@ -225,20 +265,38 @@ def run_training(granularity="fine"):
 # Main
 # -----------------------------
 if __name__ == "__main__":
+    print("\n" + "="*70)
+    print("BiLSTM TRAINING - ALIGNED WITH FLAIR/DISTILBERT")
+    print("="*70)
+    print("Changes from original:")
+    print("  ✓ Uses ORIGINAL train/val/test splits (no merge/resplit)")
+    print("  ✓ CV for hyperparameters on TRAIN set only")
+    print("  ✓ Fixed threshold = 0.4 for ALL classes (no per-class optimization)")
+    print("  ✓ Evaluates on SAME validation set as Flair/DistilBERT")
+    print("="*70)
+    
     results = []
     for granularity in ["fine", "ekman", "sentiment"]:
         result = run_training(granularity=granularity)
         results.append(result)
     
-    # Summary of all results
-    print("\n" + "="*60)
-    print("SUMMARY OF ALL GRANULARITIES")
-    print("="*60)
+    # Summary comparison
+    print("\n" + "="*70)
+    print("FINAL RESULTS SUMMARY")
+    print("="*70)
     for result in results:
         print(f"\n{result['granularity'].upper()}:")
         print(f"  Best params: γ={result['best_params'][0]}, α_scale={result['best_params'][1]}")
-        print(f"  CV F1: {result['cv_f1']:.4f}")
-        print(f"  Test Macro F1: {result['test_metrics']['macro_f1']:.4f}")
-        print(f"  Test Micro F1: {result['test_metrics']['micro_f1']:.4f}")
-
-
+        print(f"  CV F1 (on train): {result['cv_f1']:.4f}")
+        print(f"  Validation F1: {result['val_results']['macro_f1']:.4f}")
+        print(f"  Test F1: {result['test_results']['macro_f1']:.4f}")
+        print(f"  Training time: {result['training_time']:.1f}s")
+    
+    print("\n" + "="*70)
+    print("✅ READY FOR FAIR COMPARISON WITH FLAIR AND DISTILBERT")
+    print("="*70)
+    print("All models now:")
+    print("  • Use same train/val/test splits")
+    print("  • Use fixed threshold = 0.4")
+    print("  • Evaluate on same validation/test sets")
+    print("="*70)

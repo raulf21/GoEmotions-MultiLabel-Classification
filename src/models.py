@@ -10,6 +10,7 @@ class AdditiveAttentionPooling(keras.layers.Layer):
     def __init__(self, units=128, **kwargs):
         super().__init__(**kwargs)
         self.supports_masking = True
+        self.units_value = units  # Store units value
         self.score = keras.layers.Dense(units, activation='tanh')
         self.v = keras.layers.Dense(1)
 
